@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hardening.sh
+# hardening.sh 
 # Run as root
 
 set -euo pipefail
@@ -22,6 +22,38 @@ run() {
     "$@"
 }
 
+PKG_RETRY_ATTEMPTS="${PKG_RETRY_ATTEMPTS:-3}"
+PKG_RETRY_DELAY="${PKG_RETRY_DELAY:-5}"
+
+run_with_retries() {
+    local attempts="$1"
+    local delay="$2"
+    shift 2
+
+    local attempt=1
+    local status=0
+
+    while [ $attempt -le "$attempts" ]; do
+        set +e
+        "$@"
+        status=$?
+        set -e
+
+        if [ $status -eq 0 ]; then
+            return 0
+        fi
+
+        if [ $attempt -lt "$attempts" ]; then
+            warn "Command failed with exit $status (attempt ${attempt}/${attempts}); retrying in ${delay}s..."
+            sleep "$delay"
+        fi
+
+        attempt=$((attempt + 1))
+    done
+
+    return $status
+}
+
 # Check root
 if [ "$EUID" -ne 0 ]; then
     fatal "This script must be run as root."
@@ -37,48 +69,52 @@ else
 fi
 
 # Detect package manager and install/update commands
-INSTALL_CMD=""
-PKG_UPDATE_CMD=""
+INSTALL_CMD=()
+INSTALL_ENV=()
+PKG_UPDATE_CMD=()
 case "$OS_ID" in
     ubuntu|debian)
         if command -v apt-get &>/dev/null; then
-            INSTALL_CMD="apt-get install -y"
-            PKG_UPDATE_CMD="apt-get update -y"
+            INSTALL_CMD=(apt-get install -y)
+            INSTALL_ENV=(DEBIAN_FRONTEND=noninteractive)
+            PKG_UPDATE_CMD=(apt-get update)
         fi
         ;;
     centos|rhel|fedora|amzn)
         if command -v dnf &>/dev/null; then
-            INSTALL_CMD="dnf install -y"
-            PKG_UPDATE_CMD="dnf makecache"
+            INSTALL_CMD=(dnf install -y)
+            PKG_UPDATE_CMD=(dnf makecache --refresh)
         elif command -v yum &>/dev/null; then
-            INSTALL_CMD="yum install -y"
-            PKG_UPDATE_CMD="yum makecache"
+            INSTALL_CMD=(yum install -y)
+            PKG_UPDATE_CMD=(yum makecache)
         fi
         ;;
     arch|manjaro)
         if command -v pacman &>/dev/null; then
-            INSTALL_CMD="pacman -S --noconfirm"
-            PKG_UPDATE_CMD="pacman -Sy"
+            INSTALL_CMD=(pacman -S --noconfirm)
+            PKG_UPDATE_CMD=(pacman -Sy)
         fi
         ;;
     alpine)
         if command -v apk &>/dev/null; then
-            INSTALL_CMD="apk add --no-cache"
-            PKG_UPDATE_CMD="true"
+            INSTALL_CMD=(apk add --no-cache)
+            PKG_UPDATE_CMD=(true)
         fi
         ;;
     suse|opensuse)
         if command -v zypper &>/dev/null; then
-            INSTALL_CMD="zypper -n in"
-            PKG_UPDATE_CMD="zypper refresh"
+            INSTALL_CMD=(zypper -n in)
+            PKG_UPDATE_CMD=(zypper refresh)
         fi
         ;;
 esac
 
-if [ -z "$INSTALL_CMD" ]; then
+if [ ${#INSTALL_CMD[@]} -eq 0 ]; then
     warn "No known package manager detected. Automatic installations will not be available."
 else
-    info "Detected package manager: $OS_ID - using: $INSTALL_CMD"
+    install_cmd_str="$(printf '%s ' "${INSTALL_CMD[@]}")"
+    install_cmd_str="${install_cmd_str%% }"
+    info "Detected package manager: $OS_ID - using: $install_cmd_str"
 fi
 # ==========================================================
 
@@ -146,29 +182,60 @@ if [ ! -d "$ROOT_HOME/.ssh" ]; then
     chmod 700 "$ROOT_HOME/.ssh"
 fi
 
-# Abort hardening if authorized_keys is missing or empty to avoid lockout
+# If authorized_keys is missing or empty, skip SSH hardening but continue with other tasks
+SKIP_SSH_HARDEN=false
 if [ ! -s "$AUTH_KEYS" ]; then
-    fatal "No SSH keys found in $AUTH_KEYS. Aborting SSH hardening to avoid lockout."
+    warn "No SSH keys found in $AUTH_KEYS. Skipping SSH hardening to avoid lockout, continuing with other tasks."
+    SKIP_SSH_HARDEN=true
+else
+    info "SSH key(s) detected in $AUTH_KEYS. Proceeding with SSH hardening."
 fi
-info "SSH key(s) detected in $AUTH_KEYS. Proceeding with SSH hardening."
 # ==========================================================
 
 # =================== FIREWALL SETUP =======================
 info "Configuring firewall..."
 
-# Install package if missing (pkg name, check-command)
+# Helper to install if missing
 install_if_missing() {
     local pkg="$1"
     local cmd_check="$2"
-    if ! command -v "$cmd_check" &>/dev/null && [ -n "$INSTALL_CMD" ]; then
-        info "Installing required package: $pkg"
-        if [ -n "$PKG_UPDATE_CMD" ] && [ "$PKG_UPDATE_CMD" != "true" ]; then
-            $PKG_UPDATE_CMD || true
-        fi
-        set +e
-        $INSTALL_CMD "$pkg"
-        set -e
+    local attempts="$PKG_RETRY_ATTEMPTS"
+    local delay="$PKG_RETRY_DELAY"
+    local install_status=0
+
+    if command -v "$cmd_check" &>/dev/null; then
+        return 0
     fi
+
+    if [ ${#INSTALL_CMD[@]} -eq 0 ]; then
+        warn "Package manager unavailable; cannot install $pkg automatically."
+        return 1
+    fi
+
+    info "Installing required package: $pkg"
+
+    if [ ${#PKG_UPDATE_CMD[@]} -gt 0 ]; then
+        if ! run_with_retries "$attempts" "$delay" "${PKG_UPDATE_CMD[@]}"; then
+            warn "Failed to refresh package metadata (continuing anyway)."
+        fi
+    fi
+
+    if [ ${#INSTALL_ENV[@]} -gt 0 ]; then
+        if ! run_with_retries "$attempts" "$delay" env "${INSTALL_ENV[@]}" "${INSTALL_CMD[@]}" "$pkg"; then
+            install_status=1
+        fi
+    else
+        if ! run_with_retries "$attempts" "$delay" "${INSTALL_CMD[@]}" "$pkg"; then
+            install_status=1
+        fi
+    fi
+
+    if [ $install_status -ne 0 ]; then
+        warn "Failed to install $pkg after ${attempts} attempt(s)."
+        return $install_status
+    fi
+
+    return 0
 }
 
 # 1) UFW
@@ -215,11 +282,11 @@ else
     run iptables -A INPUT -p tcp --dport 80 -j ACCEPT
     run iptables -A INPUT -p tcp --dport 443 -j ACCEPT
 
-    # Persistence: RHEL-style or Debian-style
+    # Persistency: Debian/Ubuntu -> iptables-persistent; RHEL -> iptables-services
     if [ -d /etc/sysconfig ]; then
         iptables-save > /etc/sysconfig/iptables || warn "Could not save /etc/sysconfig/iptables"
     else
-        if [ -n "$INSTALL_CMD" ]; then
+        if [ ${#INSTALL_CMD[@]} -gt 0 ]; then
             install_if_missing iptables-persistent iptables-restore
         fi
         if command -v netfilter-persistent &>/dev/null; then
@@ -260,7 +327,8 @@ if command -v fail2ban-client &>/dev/null; then
     elif has_service_cmd; then
         run service fail2ban restart || warn "service fail2ban restart failed"
     else
-        warn "No service manager; cannot restart Fail2Ban automatically."
+        warn "No service manager; restarting fail2ban manually."
+        run nohup fail2ban-client -x start >/var/log/fail2ban-manual.log 2>&1 &
     fi
 else
     warn "fail2ban-client not available; skipping restart."
@@ -268,47 +336,52 @@ fi
 # ==========================================================
 
 # =================== SSH HARDENING ========================
-info "Applying SSH hardening (backups and tests included)..."
-
-SSHD_CONF="/etc/ssh/sshd_config"
-BACKUP="${SSHD_CONF}.$(date +%Y%m%d%H%M%S).bak"
-cp -a "$SSHD_CONF" "$BACKUP"
-info "Created sshd_config backup at $BACKUP"
-
-# Function to safely replace or append directives in sshd_config
-upsert_sshd_config() {
-    local key="$1"
-    local value="$2"
-    if grep -qiE "^\s*${key}\b" "$SSHD_CONF"; then
-        # Replace existing directive (case-insensitive)
-        sed -ri "s#^\s*${key}\b.*#${key} ${value}#Ig" "$SSHD_CONF"
-    else
-        echo "${key} ${value}" >> "$SSHD_CONF"
-    fi
-}
-
-# We already checked authorized_keys; now apply SSH hardening
-upsert_sshd_config "PermitRootLogin" "no"
-upsert_sshd_config "PasswordAuthentication" "no"
-upsert_sshd_config "ChallengeResponseAuthentication" "no"
-upsert_sshd_config "UsePAM" "yes"
-
-# Test configuration before restarting
-if sshd -t -f "$SSHD_CONF" 2>/tmp/sshd_test.err; then
-    info "sshd_config test passed. Restarting SSH service..."
-    service_restart sshd || service_restart ssh || warn "Could not restart sshd/ssh using common methods."
+if [ "$SKIP_SSH_HARDEN" = true ]; then
+    warn "SSH hardening skipped (authorized_keys missing). No changes to sshd_config will be made."
 else
-    error "New sshd configuration failed test. Restoring backup and aborting changes."
-    error "Test output:"
-    sed -n '1,200p' /tmp/sshd_test.err || true
-    cp -a "$BACKUP" "$SSHD_CONF"
-    fatal "sshd_config restored from $BACKUP. Check /tmp/sshd_test.err for details."
+    info "Applying SSH hardening (backups and tests included)..."
+
+    SSHD_CONF="/etc/ssh/sshd_config"
+    BACKUP="${SSHD_CONF}.$(date +%Y%m%d%H%M%S).bak"
+    cp -a "$SSHD_CONF" "$BACKUP"
+    info "Created sshd_config backup at $BACKUP"
+
+    # Function to safely replace or append directives in sshd_config
+    upsert_sshd_config() {
+        local key="$1"
+        local value="$2"
+        if grep -qiE "^\s*${key}\b" "$SSHD_CONF"; then
+            # Replace existing directive (case-insensitive)
+            sed -ri "s#^\s*${key}\b.*#${key} ${value}#Ig" "$SSHD_CONF"
+        else
+            echo "${key} ${value}" >> "$SSHD_CONF"
+        fi
+    }
+
+    upsert_sshd_config "PermitRootLogin" "no"
+    upsert_sshd_config "PasswordAuthentication" "no"
+    upsert_sshd_config "ChallengeResponseAuthentication" "no"
+    upsert_sshd_config "UsePAM" "yes"
+
+    # Test configuration before restarting
+    if sshd -t -f "$SSHD_CONF" 2>/tmp/sshd_test.err; then
+        info "sshd_config test passed. Restarting SSH service..."
+        service_restart sshd || service_restart ssh || warn "Could not restart sshd/ssh using common methods."
+    else
+        error "New sshd configuration failed test. Restoring backup and aborting changes."
+        error "Test output:"
+        sed -n '1,200p' /tmp/sshd_test.err || true
+        cp -a "$BACKUP" "$SSHD_CONF"
+        fatal "sshd_config restored from $BACKUP. Check /tmp/sshd_test.err for details."
+    fi
 fi
 
-# Ensure secure permissions
-chmod 700 "$ROOT_HOME"
-chmod 700 "$ROOT_HOME/.ssh"
-chmod 600 "$AUTH_KEYS"
+# Ensure secure permissions (always applied regardless of SSH hardening)
+chmod 700 "$ROOT_HOME" || warn "Could not chmod $ROOT_HOME"
+chmod 700 "$ROOT_HOME/.ssh" || warn "Could not chmod $ROOT_HOME/.ssh"
+if [ -s "$AUTH_KEYS" ]; then
+    chmod 600 "$AUTH_KEYS" || warn "Could not chmod $AUTH_KEYS"
+fi
 info "Adjusted permissions for /root and .ssh."
 # ==========================================================
 
@@ -316,7 +389,7 @@ info "Adjusted permissions for /root and .ssh."
 info "Configuring automatic security updates..."
 case "$OS_ID" in
     ubuntu|debian)
-        if [ -n "$INSTALL_CMD" ]; then
+        if [ ${#INSTALL_CMD[@]} -gt 0 ]; then
             install_if_missing unattended-upgrades unattended-upgrades
             # enable unattended-upgrades
             dpkg-reconfigure -plow unattended-upgrades || true
@@ -362,8 +435,12 @@ fi
 info "Hardening completed successfully."
 echo
 info "IMPORTANT: Before closing your session, verify you can open a new SSH connection from another terminal."
-info "SSH root login and password authentication have been disabled."
-info "To revert SSH changes: restore from the backup created at: $BACKUP"
+if [ "$SKIP_SSH_HARDEN" = true ]; then
+    warn "SSH hardening was skipped because no authorized_keys were found. No changes were made to sshd_config."
+else
+    info "SSH root login and password authentication have been disabled."
+    info "To revert SSH changes: restore from the backup created at: $BACKUP"
+fi
 echo
 
 # short summary of changes
@@ -371,7 +448,8 @@ cat <<SUMMARY
 Summary of changes made:
  - Firewall configured (UFW / firewalld / iptables depending on availability).
  - Fail2Ban installed/configured and restarted if possible.
- - SSH hardened: PermitRootLogin no, PasswordAuthentication no, backup and configuration test.
+ - SSH hardening: ${SKIP_SSH_HARDEN:+SKIPPED (authorized_keys missing)}${SKIP_SSH_HARDEN:+" (no sshd_config changes)"}${SKIP_SSH_HARDEN:+"":+""}
+   (If not skipped: PermitRootLogin no, PasswordAuthentication no, backup and configuration test applied.)
  - Permissions for /root and .ssh fixed.
  - Automatic security updates enabled (if OS is supported).
  - Journald configured with limited disk usage (if systemd is active).

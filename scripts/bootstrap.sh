@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# bootstrap.sh - Improved, safer bootstrap script
+# bootstrap.sh 
 # Usage: sudo ./bootstrap.sh [-n|--dry-run] [-y|--yes]
 
 set -euo pipefail
@@ -91,39 +91,39 @@ ${No}
 
 # =================== PACKAGE MANAGER DETECTION ===================
 PM=""
-INSTALL_CMD=""
+INSTALL_CMD=()
 UPDATE_CMD=""
 UPGRADE_CMD=""
 INSTALL_NONINTERACTIVE_SUFFIX=""
 
 if command -v apt-get &>/dev/null; then
     PM="apt"
-    INSTALL_CMD="apt-get install -y"
+    INSTALL_CMD=(apt-get install -y)
     UPDATE_CMD="apt-get update"
     UPGRADE_CMD="apt-get upgrade -y"
 elif command -v dnf &>/dev/null; then
     PM="dnf"
-    INSTALL_CMD="dnf install -y"
+    INSTALL_CMD=(dnf install -y)
     UPDATE_CMD="dnf makecache --refresh"
     UPGRADE_CMD="dnf upgrade -y"
 elif command -v yum &>/dev/null; then
     PM="yum"
-    INSTALL_CMD="yum install -y"
+    INSTALL_CMD=(yum install -y)
     UPDATE_CMD="yum makecache"
     UPGRADE_CMD="yum upgrade -y"
 elif command -v pacman &>/dev/null; then
     PM="pacman"
-    INSTALL_CMD="pacman -S --noconfirm"
+    INSTALL_CMD=(pacman -S --noconfirm)
     UPDATE_CMD="pacman -Sy"
     UPGRADE_CMD="pacman -Syu --noconfirm"
 elif command -v apk &>/dev/null; then
     PM="apk"
-    INSTALL_CMD="apk add --no-cache"
+    INSTALL_CMD=(apk add --no-cache)
     UPDATE_CMD="apk update"
     UPGRADE_CMD="apk upgrade"
 elif command -v zypper &>/dev/null; then
     PM="zypper"
-    INSTALL_CMD="zypper -n in"
+    INSTALL_CMD=(zypper -n in)
     UPDATE_CMD="zypper refresh"
     UPGRADE_CMD="zypper -n up"
 else
@@ -177,33 +177,30 @@ pkg_install() {
         return 0
     fi
 
-    # Confirm unless assume-yes or dry-run
-    if [ "$ASSUME_YES" = false ] && [ "$DRY_RUN" = false ]; then
-        printf "%bProceed to install %s? [Y/n]%b " "${Cyan}" "$pkg" "${No}"
-        read -r ans || true
-        case "${ans:-Y}" in
-            [Yy]*|'') : ;;
-            *) warn "Skipping installation of $pkg"; return 0 ;;
-        esac
-    fi
-
-    info "Installing $pkg..."
+    info "Installing $pkg ..."
     if [ "$DRY_RUN" = true ]; then
         # Show the install command we would run
-        case "$PM" in
-            apt) printf "%s %s\n" "$INSTALL_CMD" "$pkg" ;;
-            *) printf "%s %s\n" "$INSTALL_CMD" "$pkg" ;;
-        esac
+        if [ "$PM" = "apt" ]; then
+            printf "DEBIAN_FRONTEND=noninteractive "
+        fi
+        printf "%s " "${INSTALL_CMD[@]}"
+        printf "%s\n" "$pkg"
         return 0
     fi
 
     set +e
-    if $INSTALL_CMD "$pkg"; then
-        set -e
+    if [ "$PM" = "apt" ]; then
+        DEBIAN_FRONTEND=noninteractive "${INSTALL_CMD[@]}" "$pkg"
+    else
+        "${INSTALL_CMD[@]}" "$pkg"
+    fi
+    status=$?
+    set -e
+
+    if [ "$status" -eq 0 ]; then
         info "$pkg installed successfully."
         return 0
     else
-        set -e
         warn "Installation of $pkg failed (continuing)."
         return 1
     fi
@@ -249,3 +246,4 @@ info "===================================================="
 echo
 
 exit 0
+# =========================================================
