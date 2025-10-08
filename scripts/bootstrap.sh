@@ -1,130 +1,251 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# bootstrap.sh - Improved, safer bootstrap script
+# Usage: sudo ./bootstrap.sh [-n|--dry-run] [-y|--yes]
 
-# ========================= COLORS =========================
-Green='\033[0;32m'        # Green
-Red='\033[0;31m'          # Red
-Cyan='\033[1;36m'        # Cyan
+set -euo pipefail
+IFS=$'\n\t'
+
+# ========================= COLORS & HELPERS =========================
+Green='\033[0;32m'
+Red='\033[0;31m'
+Cyan='\033[1;36m'
 No='\e[0m'
-# ==========================================================
 
-# ========================= CHECKS =========================
-# Verify that the script is run as root
-set -e 
+info()  { printf "%b[+] %s%b\n" "${Green}" "$*" "${No}"; }
+warn()  { printf "%b[!] %s%b\n" "${Cyan}" "$*" "${No}"; }
+error() { printf "%b[-] %s%b\n" "${Red}" "$*" "${No}"; }
 
+DRY_RUN=false
+ASSUME_YES=false
+
+# Parse CLI args (simple)
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -n|--dry-run) DRY_RUN=true; shift ;;
+        -y|--yes) ASSUME_YES=true; shift ;;
+        -h|--help)
+            cat <<USAGE
+Usage: $0 [options]
+Options:
+  -n, --dry-run    Print actions without executing (safe preview)
+  -y, --yes        Assume yes for all package installs/operations
+  -h, --help       Show this help
+USAGE
+            exit 0
+            ;;
+        *) warn "Unknown option: $1"; shift ;;
+    esac
+done
+
+run() {
+    # Print command, then execute unless dry-run
+    printf "%b> %s%b\n" "${Cyan}" "$*" "${No}"
+    if [ "$DRY_RUN" = false ]; then
+        "$@"
+    fi
+}
+
+run_sh() {
+    # Run a shell string (useful for complex commands)
+    printf "%b> %s%b\n" "${Cyan}" "$*" "${No}"
+    if [ "$DRY_RUN" = false ]; then
+        bash -c "$*"
+    fi
+}
+
+# ========================= BASIC CHECKS =========================
 if [ "$EUID" -ne 0 ]; then
-    echo -e "${Red}Please run as root${No}"
-    exit
-fi
-
-# Determine the DISTRO and VERSION
-if [ -f /etc/os-release ]; then
-    . /etc/os-release
-    OS=$ID
-    VER=$VERSION_ID
-else
-    echo -e "${Red}Cannot determine the operating system.${No}"
+    error "This script must be run as root."
     exit 1
 fi
+
+if [ ! -f /etc/os-release ]; then
+    error "/etc/os-release not found; cannot determine distribution."
+    exit 1
+fi
+
+# Source /etc/os-release for distro info
+. /etc/os-release
+OS_ID="${ID:-unknown}"
+OS_VER="${VERSION_ID:-unknown}"
+
+info "Detected OS: ${OS_ID} ${OS_VER}"
+info "Dry run: ${DRY_RUN}, Assume yes: ${ASSUME_YES}"
 # ==========================================================
 
 # ========================= BANNER =========================
-echo -e "${Cyan}  _     ___ _   _ _   ___  __ "
-echo -e "${Cyan} | |   |_ _| \ | | | | \ \/ / "
-echo -e "${Cyan} | |    | ||  \| | | | |\  /  "
-echo -e "${Cyan} | |___ | || |\  | |_| |/  \  "
-echo -e "${Cyan} |_____||_||_| \_|\___//_/\_\ "
-echo -e "${Cyan}  ____   ___   ___ _____ ____ _____ ____      _    ____   "
-echo -e "${Cyan} | __ ) / _ \ / _ \_   _/ ___|_   _|  _ \    / \  |  _ \  "
-echo -e "${Cyan} |  _ \| | | | | | || | \___ \ | | | |_) |  / _ \ | |_) | "
-echo -e "${Cyan} | |_) | |_| | |_| || |  ___) || | |  _ <  / ___ \|  __/  "
-echo -e "${Cyan} |____/ \___/ \___/ |_| |____/ |_| |_| \_\/_/   \_\_|     "
-echo -e "${Cyan}"
-# =========================================================
+echo -e "${Cyan}
+  _     ___ _   _ _   ___  __
+ | |   |_ _| \ | | | | \ \/ /
+ | |    | ||  \| | | | |\  /
+ | |___ | || |\  | |_| |/  \ 
+ |_____||_||_| \_|\___//_/\_\\
+  ____   ___   ___ _____ ____ _____ ____      _    ____   
+ | __ ) / _ \ / _ \_   _/ ___|_   _|  _ \    / \  |  _ \  
+ |  _ \| | | | | | || | \___ \ | | | |_) |  / _ \ | |_) | 
+ | |_) | |_| | |_| || |  ___) || | |  _ <  / ___ \|  __/  
+ |____/ \___/ \___/ |_| |____/ |_| |_| \_\/_/   \_\_|     
+${No}
+"
+# ==========================================================
 
-# =================== PACKAGE MANAGER =====================
-echo -e "${Green}Checking package manager...${No}"
+# =================== PACKAGE MANAGER DETECTION ===================
+PM=""
+INSTALL_CMD=""
+UPDATE_CMD=""
+UPGRADE_CMD=""
+INSTALL_NONINTERACTIVE_SUFFIX=""
 
-case "$OS" in
-    ubuntu|debian)
-        if ! command -v apt &> /dev/null; then
-            echo -e "${Red}apt could not be found. Please install it.${No}"
-            exit 1
-        fi
-        echo -e "${Green}Using apt as the package manager.${No}"
-        UPDATE_CMD="apt update -y"
-        UPGRADE_CMD="apt upgrade -y"
-        INSTALL_CMD="apt install -y"
-        ;;
-    centos|rhel|fedora|amzn)
-        if ! command -v yum &> /dev/null && ! command -v dnf &> /dev/null; then
-            echo -e "${Red}Neither yum nor dnf could be found. Please install one of them.${No}"
-            exit 1
-        fi
-        if command -v dnf &> /dev/null; then
-            echo -e "${Green}Using dnf as the package manager.${No}"
-            UPDATE_CMD="dnf update -y"
-            UPGRADE_CMD="dnf upgrade -y"
-            INSTALL_CMD="dnf install -y"
-        else
-            echo -e "${Green}Using yum as the package manager.${No}"
-            UPDATE_CMD="yum update -y"
-            UPGRADE_CMD="yum upgrade -y"
-            INSTALL_CMD="yum install -y"
-        fi
-        ;;
-    *)
-        echo -e "${Red}Unsupported operating system: $OS${No}"
-        exit 1
-        ;;
-esac
-# =========================================================
+if command -v apt-get &>/dev/null; then
+    PM="apt"
+    INSTALL_CMD="apt-get install -y"
+    UPDATE_CMD="apt-get update"
+    UPGRADE_CMD="apt-get upgrade -y"
+elif command -v dnf &>/dev/null; then
+    PM="dnf"
+    INSTALL_CMD="dnf install -y"
+    UPDATE_CMD="dnf makecache --refresh"
+    UPGRADE_CMD="dnf upgrade -y"
+elif command -v yum &>/dev/null; then
+    PM="yum"
+    INSTALL_CMD="yum install -y"
+    UPDATE_CMD="yum makecache"
+    UPGRADE_CMD="yum upgrade -y"
+elif command -v pacman &>/dev/null; then
+    PM="pacman"
+    INSTALL_CMD="pacman -S --noconfirm"
+    UPDATE_CMD="pacman -Sy"
+    UPGRADE_CMD="pacman -Syu --noconfirm"
+elif command -v apk &>/dev/null; then
+    PM="apk"
+    INSTALL_CMD="apk add --no-cache"
+    UPDATE_CMD="apk update"
+    UPGRADE_CMD="apk upgrade"
+elif command -v zypper &>/dev/null; then
+    PM="zypper"
+    INSTALL_CMD="zypper -n in"
+    UPDATE_CMD="zypper refresh"
+    UPGRADE_CMD="zypper -n up"
+else
+    error "No known package manager detected. Supported: apt, dnf, yum, pacman, apk, zypper."
+    exit 1
+fi
 
-# =================== SYSTEM UPDATE =======================
-echo -e "${Green}Updating system packages...${No}"
-eval $UPDATE_CMD
-eval $UPGRADE_CMD
-# =========================================================
+info "Using package manager: $PM"
+# ==========================================================
 
-# =================== INSTALL DEPENDENCIES =================
-echo -e "${Green}Installing basic tools...${No}"
-DEPENDENCIES=(curl git vim ufw fail2ban htop)
+# =================== PACKAGE PRESENCE CHECK ====================
+# Map package -> command to check for presence (some packages expose different binaries)
+declare -A PKG_CHECK=(
+    [curl]=curl
+    [git]=git
+    [vim]=vim
+    [fail2ban]=fail2ban-client
+    [htop]=htop
+    [net-tools]=ifconfig
+    [sysstat]=iostat
+    [iotop]=iotop
+)
 
-for package in "${DEPENDENCIES[@]}"; do
-    if ! command -v $package &> /dev/null; then
-        echo -e "${Green}Installing $package...${No}"
-        eval "$INSTALL_CMD $package"
-    else
-        echo -e "${Green}$package is already installed.${No}"
+is_installed() {
+    local pkg="$1"
+    local checkcmd="${PKG_CHECK[$pkg]:-$pkg}"
+
+    # First prefer command presence
+    if command -v "$checkcmd" &>/dev/null; then
+        return 0
     fi
+
+    # Fallback to package database query if available
+    if [ "$PM" = "apt" ]; then
+        dpkg -s "$pkg" &>/dev/null && return 0 || return 1
+    elif [ "$PM" = "dnf" ] || [ "$PM" = "yum" ] || [ "$PM" = "zypper" ]; then
+        rpm -q "$pkg" &>/dev/null && return 0 || return 1
+    elif [ "$PM" = "pacman" ]; then
+        pacman -Qi "$pkg" &>/dev/null && return 0 || return 1
+    elif [ "$PM" = "apk" ]; then
+        apk info -e "$pkg" &>/dev/null && return 0 || return 1
+    fi
+
+    return 1
+}
+
+pkg_install() {
+    local pkg="$1"
+    if is_installed "$pkg"; then
+        info "$pkg is already installed."
+        return 0
+    fi
+
+    # Confirm unless assume-yes or dry-run
+    if [ "$ASSUME_YES" = false ] && [ "$DRY_RUN" = false ]; then
+        printf "%bProceed to install %s? [Y/n]%b " "${Cyan}" "$pkg" "${No}"
+        read -r ans || true
+        case "${ans:-Y}" in
+            [Yy]*|'') : ;;
+            *) warn "Skipping installation of $pkg"; return 0 ;;
+        esac
+    fi
+
+    info "Installing $pkg..."
+    if [ "$DRY_RUN" = true ]; then
+        # Show the install command we would run
+        case "$PM" in
+            apt) printf "%s %s\n" "$INSTALL_CMD" "$pkg" ;;
+            *) printf "%s %s\n" "$INSTALL_CMD" "$pkg" ;;
+        esac
+        return 0
+    fi
+
+    set +e
+    if $INSTALL_CMD "$pkg"; then
+        set -e
+        info "$pkg installed successfully."
+        return 0
+    else
+        set -e
+        warn "Installation of $pkg failed (continuing)."
+        return 1
+    fi
+}
+# ==========================================================
+
+# =================== SYSTEM UPDATE / UPGRADE ===================
+info "Updating package cache..."
+if [ "$DRY_RUN" = true ]; then
+    printf "%b> %s%b\n" "${Cyan}" "$UPDATE_CMD" "${No}"
+else
+    run_sh "$UPDATE_CMD"
+fi
+
+info "Upgrading installed packages..."
+if [ "$DRY_RUN" = true ]; then
+    printf "%b> %s%b\n" "${Cyan}" "$UPGRADE_CMD" "${No}"
+else
+    run_sh "$UPGRADE_CMD"
+fi
+# ==========================================================
+
+# =================== DEPENDENCIES INSTALLATION ===================
+info "Installing basic tools..."
+
+DEPENDENCIES=(curl git vim fail2ban htop net-tools sysstat iotop)
+
+for pkg in "${DEPENDENCIES[@]}"; do
+    pkg_install "$pkg" || warn "Continuing despite $pkg install failure."
 done
-# =========================================================
+# ==========================================================
 
-# =================== FIREWALL SETUP =======================
-echo -e "${Green}Setting up UFW firewall...${No}"
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow 22/tcp
-ufw allow 80/tcp
-ufw allow 443/tcp
-ufw --force enable
-# =========================================================
+# =================== FINAL MESSAGE =========================
+echo
+info "===================================================="
+info "   Bootstrap completed (see messages above)"
+if [ "$DRY_RUN" = true ]; then
+    warn "This was a dry-run; no changes were actually applied."
+else
+    info "Please consider rebooting the system to finalize kernel/security updates if any."
+fi
+info "===================================================="
+echo
 
-# =================== FAIL2BAN SETUP =======================
-echo -e "${Green}Configuring Fail2Ban...${No}"
-cat <<EOL > /etc/fail2ban/jail.local 
-[DEFAULT]
-bantime = 1h
-findtime = 10m
-maxretry = 5
-
-[sshd]
-enabled = true
-EOL
-systemctl restart fail2ban
-systemctl enable fail2ban
-# =========================================================
-
-# =================== FINAL MESSAGE =======================
-echo -e "${Green}Bootstrap completed successfully!${No}"
-echo -e "${Green}Please reboot the system to apply all changes.${No}"
-# =========================================================
+exit 0
