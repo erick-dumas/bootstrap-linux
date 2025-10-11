@@ -37,6 +37,8 @@ USAGE
     esac
 done
 
+PKG_IGNORE_PACKAGEKIT=${PKG_IGNORE_PACKAGEKIT:-true}
+
 # ===============================================================
 
 # ========================= RUN HELPERS =========================
@@ -56,12 +58,38 @@ run_sh() {
     fi
 }
 
+lockfile_is_active() {
+    local file="$1"
+
+    if [ ! -e "$file" ]; then
+        return 1
+    fi
+
+    if command -v fuser &>/dev/null; then
+        if fuser "$file" &>/dev/null; then
+            return 0
+        fi
+    fi
+
+    if command -v lsof &>/dev/null; then
+        if lsof "$file" &>/dev/null; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
 # Wait while common package manager processes are running
 wait_for_pkg_mgr() {
     local max_wait=60   # Seconds to wait before giving up
     local sleep_for=5
     local waited=0
-    local procs=(apt apt-get dpkg aptitude apt-key apt-get update apt-fast yum dnf packagekit pkcon pacman pacman-key zypper apk)
+    local procs=(apt apt-get dpkg aptitude apt-key apt-get update apt-fast yum dnf pacman pacman-key zypper apk)
+    if [ "$PKG_IGNORE_PACKAGEKIT" != "true" ]; then
+        procs+=(packagekit packagekitd pkcon)
+    fi
+    local lockfiles=(/var/lib/dpkg/lock /var/lib/dpkg/lock-frontend /var/cache/apt/archives/lock /var/lib/apt/lists/lock /var/run/yum.pid)
     while : ; do
         local found=""
         for p in "${procs[@]}"; do
@@ -72,9 +100,18 @@ wait_for_pkg_mgr() {
         done
         if [ -z "$found" ]; then
             # also check lockfiles as a last resort
-            if [ -e /var/lib/dpkg/lock ] || [ -e /var/lib/dpkg/lock-frontend ] || [ -e /var/cache/apt/archives/lock ] || [ -e /var/run/yum.pid ]; then
-                found="lockfile"
-            fi
+            local lock
+            for lock in "${lockfiles[@]}"; do
+                if [ -e "$lock" ]; then
+                    if lockfile_is_active "$lock"; then
+                        found="lockfile:$lock"
+                        break
+                    else
+                        warn "Ignoring stale package manager lock file: $lock"
+                        rm -f "$lock" 2>/dev/null || true
+                    fi
+                fi
+            done
         fi
 
         if [ -z "$found" ]; then
@@ -82,11 +119,11 @@ wait_for_pkg_mgr() {
         fi
 
         if [ "$waited" -ge "$max_wait" ]; then
-            warn "El gestor de paquetes sigue ocupado (proceso: $found) después de ${max_wait}s; continuando de todos modos."
+            warn "Package manager still busy (process: $found) after ${max_wait}s; continuing anyway."
             return 1
         fi
 
-        warn "Gestor de paquetes ocupado ($found). Esperando ${sleep_for}s..."
+        warn "Package manager busy ($found). Waiting ${sleep_for}s..."
         sleep "$sleep_for"
         waited=$((waited + sleep_for))
     done
@@ -313,7 +350,7 @@ ensure_epel_if_needed() {
 
     # Try amazon-linux-extras (Amazon Linux)
     if command -v amazon-linux-extras &>/dev/null; then
-        ingo "Trying to enable epel via amazon-linux-extras..."
+        info "Trying to enable epel via amazon-linux-extras..."
         if [ "$DRY_RUN" = false ]; then
             amazon-linux-extras install epel -y || true
         else
